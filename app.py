@@ -1,6 +1,3 @@
-# app.py (FIXED) — persists sync results + GPT output across reruns, safer OpenAI init,
-# and removes the TF-IDF “two different vectorizers” bug by doing joint TF-IDF properly.
-
 import os, re, io
 import numpy as np
 import pandas as pd
@@ -23,11 +20,33 @@ api_key = os.getenv("OPENAI_API_KEY")
 client = OpenAI(api_key=api_key) if api_key else None
 
 # -----------------------------
-# File reading
+# Session state init
 # -----------------------------
-def read_uploaded_file(uploaded) -> str:
-    name = uploaded.name.lower()
-    data = uploaded.read()
+def init_state():
+    defaults = {
+        "sync_done": False,
+        "all_matches": None,
+        "best": None,
+        "per_strategy": None,
+        "overall": 0.0,
+        "emb_label": "",
+        "gpt_text": "",
+        "strat_bytes": None,
+        "act_bytes": None,
+        "strat_name": None,
+        "act_name": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
+
+# -----------------------------
+# File reading (from bytes)
+# -----------------------------
+def read_file_from_bytes(filename: str, data: bytes) -> str:
+    name = filename.lower()
 
     if name.endswith(".txt") or name.endswith(".md"):
         return data.decode("utf-8", errors="ignore")
@@ -98,40 +117,19 @@ def normalize_strategic_objectives(strategic_text: str, n=10) -> pd.DataFrame:
     return pd.DataFrame(units)
 
 # -----------------------------
-# Embeddings
+# Embeddings: TF-IDF only (cloud-safe, no downloads)
 # -----------------------------
-@st.cache_resource
-def load_sentence_transformer():
-    try:
-        from sentence_transformers import SentenceTransformer
-        return SentenceTransformer("all-MiniLM-L6-v2")
-    except Exception:
-        return None
-
 def embed_joint(strategy_texts, action_texts):
-    """
-    Returns:
-      strat_emb (n_strat, d), act_emb (n_act, d), label
-    Ensures both sides share the same embedding space.
-    """
-    st_model = load_sentence_transformer()
-    if st_model is not None:
-        strat_emb = st_model.encode(strategy_texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-        act_emb   = st_model.encode(action_texts,   convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-        return strat_emb, act_emb, "SentenceTransformer (all-MiniLM-L6-v2)"
-
-    # TF-IDF fallback: MUST be fit once on joint corpus
     joint = strategy_texts + action_texts
     vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
     joint_emb = vectorizer.fit_transform(joint).toarray().astype(np.float32)
 
-    # L2 normalize
     norm = np.linalg.norm(joint_emb, axis=1, keepdims=True) + 1e-9
     joint_emb = joint_emb / norm
 
     strat_emb = joint_emb[:len(strategy_texts)]
     act_emb   = joint_emb[len(strategy_texts):]
-    return strat_emb, act_emb, "TF-IDF fallback"
+    return strat_emb, act_emb, "TF-IDF"
 
 # -----------------------------
 # Alignment
@@ -141,7 +139,7 @@ def build_alignment(strat_df: pd.DataFrame, act_df: pd.DataFrame, top_k=3):
     action_texts   = [f"{r.action_title}\n{r.action_text}" for r in act_df.itertuples(index=False)]
 
     strat_emb, act_emb, emb_label = embed_joint(strategy_texts, action_texts)
-    sim = cosine_similarity(act_emb, strat_emb)  # (actions x strategies)
+    sim = cosine_similarity(act_emb, strat_emb)
 
     rows = []
     for i in range(sim.shape[0]):
@@ -194,58 +192,55 @@ Return in this exact structure:
 
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role": "user", "content": prompt}],
+        messages=[{"role":"user","content": prompt}],
         temperature=0.3,
     )
     return resp.choices[0].message.content.strip()
 
 # -----------------------------
-# Session State (persistence across reruns)
-# -----------------------------
-def init_state():
-    defaults = {
-        "sync_done": False,
-        "all_matches": None,
-        "best": None,
-        "per_strategy": None,
-        "overall": 0.0,
-        "emb_label": "",
-        "gpt_text": "",
-        "last_threshold": None,
-        "last_top_k": None,
-    }
-    for k, v in defaults.items():
-        if k not in st.session_state:
-            st.session_state[k] = v
-
-init_state()
-
-# -----------------------------
 # UI
 # -----------------------------
 st.title("ISPS — Intelligent Strategic Plan Synchronization System")
-st.caption("Upload plans → similarity mapping → dashboard → live GPT improvements (no FAISS; cloud-safe).")
+st.caption("Upload plans → similarity mapping → dashboard → live GPT improvements (cloud-safe).")
 
 with st.sidebar:
     st.header("Upload")
-    strat_file = st.file_uploader("Strategic Plan (.md/.txt/.docx/.pdf)", type=["md", "txt", "docx", "pdf"])
-    act_file   = st.file_uploader("Action Plan (.md/.txt/.docx/.pdf)", type=["md", "txt", "docx", "pdf"])
+    strat_file = st.file_uploader(
+        "Strategic Plan (.md/.txt/.docx/.pdf)",
+        type=["md","txt","docx","pdf"],
+        key="strat_uploader"
+    )
+    act_file   = st.file_uploader(
+        "Action Plan (.md/.txt/.docx/.pdf)",
+        type=["md","txt","docx","pdf"],
+        key="act_uploader"
+    )
 
     st.header("Settings")
-    top_k = st.slider("Top-K matches", 1, 5, 3)
-    threshold = st.slider("Low alignment threshold", 0.20, 0.90, 0.60, 0.01)
+    top_k = st.slider("Top-K matches", 1, 5, 3, key="top_k")
+    threshold = st.slider("Low alignment threshold", 0.20, 0.90, 0.60, 0.01, key="threshold")
     st.markdown("---")
     st.write("Live GPT:", "✅ Enabled" if client else "❌ Add OPENAI_API_KEY in Secrets")
 
-if not strat_file or not act_file:
+# Store uploaded bytes ONCE (prevents “file consumed on rerun”)
+if strat_file is not None:
+    st.session_state.strat_bytes = strat_file.getvalue()
+    st.session_state.strat_name = strat_file.name
+
+if act_file is not None:
+    st.session_state.act_bytes = act_file.getvalue()
+    st.session_state.act_name = act_file.name
+
+if st.session_state.strat_bytes is None or st.session_state.act_bytes is None:
     st.info("Upload both documents to start.")
     st.stop()
 
-strategic_text = read_uploaded_file(strat_file)
-action_text = read_uploaded_file(act_file)
+# Always rebuild parsed data from stored bytes (stable across reruns)
+strategic_text = read_file_from_bytes(st.session_state.strat_name, st.session_state.strat_bytes)
+action_text    = read_file_from_bytes(st.session_state.act_name, st.session_state.act_bytes)
 
 strat_df = normalize_strategic_objectives(strategic_text, n=10)
-act_df = extract_actions(action_text)
+act_df   = extract_actions(action_text)
 
 c1, c2 = st.columns(2)
 with c1:
@@ -257,20 +252,8 @@ with c2:
     st.write("Actions:", len(act_df))
     st.dataframe(act_df[["action_title"]].head(30), use_container_width=True)
 
-# If settings changed after a previous run, mark sync as stale
-if st.session_state.last_threshold is None:
-    st.session_state.last_threshold = threshold
-if st.session_state.last_top_k is None:
-    st.session_state.last_top_k = top_k
-
-if (threshold != st.session_state.last_threshold) or (top_k != st.session_state.last_top_k):
-    # Keep old results but clearly indicate they're stale
-    st.session_state.last_threshold = threshold
-    st.session_state.last_top_k = top_k
-
-run = st.button("Run Synchronization", type="primary", key="run_sync")
-
-if run:
+# Run sync button -> save into session_state
+if st.button("Run Synchronization", type="primary", key="run_sync"):
     with st.spinner("Computing similarity..."):
         all_matches, best, per_strategy, overall, emb_label = build_alignment(strat_df, act_df, top_k=top_k)
 
@@ -280,15 +263,15 @@ if run:
     st.session_state.per_strategy = per_strategy
     st.session_state.overall = overall
     st.session_state.emb_label = emb_label
-    st.session_state.gpt_text = ""  # clear prior GPT output on new run
+    st.session_state.gpt_text = ""  # reset previous GPT output
 
-# ---------- Render results if we have them ----------
+# Render results IF already synced (this is what stops “jumping back”)
 if st.session_state.sync_done and st.session_state.best is not None:
     all_matches = st.session_state.all_matches
-    best = st.session_state.best
-    per_strategy = st.session_state.per_strategy
-    overall = st.session_state.overall
-    emb_label = st.session_state.emb_label
+    best        = st.session_state.best
+    per_strategy= st.session_state.per_strategy
+    overall     = st.session_state.overall
+    emb_label   = st.session_state.emb_label
 
     st.success(f"Embedding method: {emb_label}")
 
@@ -303,37 +286,19 @@ if st.session_state.sync_done and st.session_state.best is not None:
 
     st.subheader("Best Match per Action")
     view = best.copy()
-    view["band"] = pd.cut(
-        view["cosine_similarity"],
-        bins=[-1, threshold, 0.75, 1.01],
-        labels=["Poor", "Medium", "Good"],
-    )
-    st.dataframe(
-        view[["action_id", "action_title", "strategy_title", "cosine_similarity", "band"]],
-        use_container_width=True,
-    )
+    view["band"] = pd.cut(view["cosine_similarity"], bins=[-1, threshold, 0.75, 1.01], labels=["Poor", "Medium", "Good"])
+    st.dataframe(view[["action_id","action_title","strategy_title","cosine_similarity","band"]],
+                 use_container_width=True)
 
-    st.download_button(
-        "Download alignment_results.csv (Top-K matches)",
-        data=all_matches.to_csv(index=False).encode("utf-8"),
-        file_name="alignment_results.csv",
-        mime="text/csv",
-        key="dl_all",
-    )
-    st.download_button(
-        "Download best_matches.csv",
-        data=best.to_csv(index=False).encode("utf-8"),
-        file_name="best_matches.csv",
-        mime="text/csv",
-        key="dl_best",
-    )
-    st.download_button(
-        "Download strategy_alignment_summary.csv",
-        data=per_strategy.to_csv(index=False).encode("utf-8"),
-        file_name="strategy_alignment_summary.csv",
-        mime="text/csv",
-        key="dl_strat",
-    )
+    st.download_button("Download alignment_results.csv (Top-K matches)",
+                       data=all_matches.to_csv(index=False).encode("utf-8"),
+                       file_name="alignment_results.csv", mime="text/csv", key="dl_all")
+    st.download_button("Download best_matches.csv",
+                       data=best.to_csv(index=False).encode("utf-8"),
+                       file_name="best_matches.csv", mime="text/csv", key="dl_best")
+    st.download_button("Download strategy_alignment_summary.csv",
+                       data=per_strategy.to_csv(index=False).encode("utf-8"),
+                       file_name="strategy_alignment_summary.csv", mime="text/csv", key="dl_strat")
 
     st.subheader("Live Intelligent Improvements (GPT)")
     low = best[best["cosine_similarity"] < threshold].sort_values("cosine_similarity").copy()
@@ -344,7 +309,7 @@ if st.session_state.sync_done and st.session_state.best is not None:
             "Select low-alignment action",
             options=low["action_id"].tolist(),
             key="low_pick",
-            format_func=lambda aid: f"Action {aid}: {low[low['action_id']==aid]['action_title'].values[0][:90]}",
+            format_func=lambda aid: f"Action {aid}: {low[low['action_id']==aid]['action_title'].values[0][:90]}"
         )
         row = low[low["action_id"] == pick].iloc[0]
 
@@ -352,15 +317,12 @@ if st.session_state.sync_done and st.session_state.best is not None:
             with st.spinner("Calling GPT..."):
                 try:
                     st.session_state.gpt_text = gpt_suggestion(
-                        row["strategy_title"],
-                        row["action_title"],
-                        row["cosine_similarity"],
+                        row["strategy_title"], row["action_title"], row["cosine_similarity"]
                     )
                 except Exception as e:
                     st.session_state.gpt_text = f"GPT call failed: {e}"
 
         st.text_area("Suggestion Output", st.session_state.gpt_text, height=320, key="gpt_out")
-
     else:
         st.success("No low-alignment actions under current threshold.")
 else:
