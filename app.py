@@ -1,3 +1,6 @@
+# app.py (FIXED) — persists sync results + GPT output across reruns, safer OpenAI init,
+# and removes the TF-IDF “two different vectorizers” bug by doing joint TF-IDF properly.
+
 import os, re, io
 import numpy as np
 import pandas as pd
@@ -9,7 +12,6 @@ from pypdf import PdfReader
 from sklearn.metrics.pairwise import cosine_similarity
 from sklearn.feature_extraction.text import TfidfVectorizer
 
-# Optional live GPT suggestions
 from openai import OpenAI
 
 st.set_page_config(page_title="ISPS Dashboard", layout="wide")
@@ -18,7 +20,7 @@ st.set_page_config(page_title="ISPS Dashboard", layout="wide")
 # OpenAI
 # -----------------------------
 api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI() if api_key else None
+client = OpenAI(api_key=api_key) if api_key else None
 
 # -----------------------------
 # File reading
@@ -79,7 +81,7 @@ def normalize_strategic_objectives(strategic_text: str, n=10) -> pd.DataFrame:
     core = m.group(1) if m else strategic_text
     core = re.sub(r"\n{3,}", "\n\n", core).strip()
 
-    chunk_size = max(1500, len(core)//n)
+    chunk_size = max(1500, len(core)//n) if n else max(1500, len(core))
     chunks, i = [], 0
     while i < len(core) and len(chunks) < n:
         chunks.append(core[i:i+chunk_size].strip())
@@ -96,49 +98,49 @@ def normalize_strategic_objectives(strategic_text: str, n=10) -> pd.DataFrame:
     return pd.DataFrame(units)
 
 # -----------------------------
-# Embeddings (SentenceTransformer) with TF-IDF fallback
+# Embeddings
 # -----------------------------
 @st.cache_resource
-def load_embedder():
-    # Try sentence-transformers; if it fails, we will fallback to TF-IDF later.
+def load_sentence_transformer():
     try:
         from sentence_transformers import SentenceTransformer
-        return ("st", SentenceTransformer("all-MiniLM-L6-v2"))
+        return SentenceTransformer("all-MiniLM-L6-v2")
     except Exception:
-        return ("tfidf", None)
+        return None
 
-def embed_texts(texts: list[str]):
-    mode, model = load_embedder()
-    if mode == "st":
-        # Normalize so cosine similarity is stable
-        emb = model.encode(texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
-        return emb, "SentenceTransformer (all-MiniLM-L6-v2)"
-    else:
-        # TF-IDF fallback (no downloads)
-        vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1,2))
-        emb = vectorizer.fit_transform(texts).toarray().astype(np.float32)
-        # L2 normalize
-        norm = np.linalg.norm(emb, axis=1, keepdims=True) + 1e-9
-        emb = emb / norm
-        return emb, "TF-IDF fallback"
+def embed_joint(strategy_texts, action_texts):
+    """
+    Returns:
+      strat_emb (n_strat, d), act_emb (n_act, d), label
+    Ensures both sides share the same embedding space.
+    """
+    st_model = load_sentence_transformer()
+    if st_model is not None:
+        strat_emb = st_model.encode(strategy_texts, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+        act_emb   = st_model.encode(action_texts,   convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False)
+        return strat_emb, act_emb, "SentenceTransformer (all-MiniLM-L6-v2)"
+
+    # TF-IDF fallback: MUST be fit once on joint corpus
+    joint = strategy_texts + action_texts
+    vectorizer = TfidfVectorizer(max_features=5000, ngram_range=(1, 2))
+    joint_emb = vectorizer.fit_transform(joint).toarray().astype(np.float32)
+
+    # L2 normalize
+    norm = np.linalg.norm(joint_emb, axis=1, keepdims=True) + 1e-9
+    joint_emb = joint_emb / norm
+
+    strat_emb = joint_emb[:len(strategy_texts)]
+    act_emb   = joint_emb[len(strategy_texts):]
+    return strat_emb, act_emb, "TF-IDF fallback"
 
 # -----------------------------
-# Alignment (no FAISS)
+# Alignment
 # -----------------------------
 def build_alignment(strat_df: pd.DataFrame, act_df: pd.DataFrame, top_k=3):
     strategy_texts = [f"{r.strategy_title}\n{r.strategy_text}" for r in strat_df.itertuples(index=False)]
     action_texts   = [f"{r.action_title}\n{r.action_text}" for r in act_df.itertuples(index=False)]
 
-    strat_emb, emb_label = embed_texts(strategy_texts)
-    act_emb, _ = embed_texts(action_texts)  # for TF-IDF we'd need same vectorizer; so do joint below if TF-IDF
-
-    # If TF-IDF mode, we must embed jointly with one vectorizer:
-    if emb_label == "TF-IDF fallback":
-        joint = strategy_texts + action_texts
-        joint_emb, _ = embed_texts(joint)
-        strat_emb = joint_emb[:len(strategy_texts)]
-        act_emb   = joint_emb[len(strategy_texts):]
-
+    strat_emb, act_emb, emb_label = embed_joint(strategy_texts, action_texts)
     sim = cosine_similarity(act_emb, strat_emb)  # (actions x strategies)
 
     rows = []
@@ -188,13 +190,35 @@ Return in this exact structure:
 3) Missing tasks / steps (3–7 bullet points)
 4) Timeline adjustment (1 sentence)
 5) Owner/role suggestion (1 line)
-"""
+""".strip()
+
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
-        messages=[{"role":"user","content": prompt}],
+        messages=[{"role": "user", "content": prompt}],
         temperature=0.3,
     )
     return resp.choices[0].message.content.strip()
+
+# -----------------------------
+# Session State (persistence across reruns)
+# -----------------------------
+def init_state():
+    defaults = {
+        "sync_done": False,
+        "all_matches": None,
+        "best": None,
+        "per_strategy": None,
+        "overall": 0.0,
+        "emb_label": "",
+        "gpt_text": "",
+        "last_threshold": None,
+        "last_top_k": None,
+    }
+    for k, v in defaults.items():
+        if k not in st.session_state:
+            st.session_state[k] = v
+
+init_state()
 
 # -----------------------------
 # UI
@@ -204,8 +228,8 @@ st.caption("Upload plans → similarity mapping → dashboard → live GPT impro
 
 with st.sidebar:
     st.header("Upload")
-    strat_file = st.file_uploader("Strategic Plan (.md/.txt/.docx/.pdf)", type=["md","txt","docx","pdf"])
-    act_file   = st.file_uploader("Action Plan (.md/.txt/.docx/.pdf)", type=["md","txt","docx","pdf"])
+    strat_file = st.file_uploader("Strategic Plan (.md/.txt/.docx/.pdf)", type=["md", "txt", "docx", "pdf"])
+    act_file   = st.file_uploader("Action Plan (.md/.txt/.docx/.pdf)", type=["md", "txt", "docx", "pdf"])
 
     st.header("Settings")
     top_k = st.slider("Top-K matches", 1, 5, 3)
@@ -233,9 +257,38 @@ with c2:
     st.write("Actions:", len(act_df))
     st.dataframe(act_df[["action_title"]].head(30), use_container_width=True)
 
-if st.button("Run Synchronization", type="primary"):
+# If settings changed after a previous run, mark sync as stale
+if st.session_state.last_threshold is None:
+    st.session_state.last_threshold = threshold
+if st.session_state.last_top_k is None:
+    st.session_state.last_top_k = top_k
+
+if (threshold != st.session_state.last_threshold) or (top_k != st.session_state.last_top_k):
+    # Keep old results but clearly indicate they're stale
+    st.session_state.last_threshold = threshold
+    st.session_state.last_top_k = top_k
+
+run = st.button("Run Synchronization", type="primary", key="run_sync")
+
+if run:
     with st.spinner("Computing similarity..."):
         all_matches, best, per_strategy, overall, emb_label = build_alignment(strat_df, act_df, top_k=top_k)
+
+    st.session_state.sync_done = True
+    st.session_state.all_matches = all_matches
+    st.session_state.best = best
+    st.session_state.per_strategy = per_strategy
+    st.session_state.overall = overall
+    st.session_state.emb_label = emb_label
+    st.session_state.gpt_text = ""  # clear prior GPT output on new run
+
+# ---------- Render results if we have them ----------
+if st.session_state.sync_done and st.session_state.best is not None:
+    all_matches = st.session_state.all_matches
+    best = st.session_state.best
+    per_strategy = st.session_state.per_strategy
+    overall = st.session_state.overall
+    emb_label = st.session_state.emb_label
 
     st.success(f"Embedding method: {emb_label}")
 
@@ -250,27 +303,36 @@ if st.button("Run Synchronization", type="primary"):
 
     st.subheader("Best Match per Action")
     view = best.copy()
-    view["band"] = pd.cut(view["cosine_similarity"], bins=[-1, threshold, 0.75, 1.01], labels=["Poor", "Medium", "Good"])
-    st.dataframe(view[["action_id","action_title","strategy_title","cosine_similarity","band"]],
-                 use_container_width=True)
+    view["band"] = pd.cut(
+        view["cosine_similarity"],
+        bins=[-1, threshold, 0.75, 1.01],
+        labels=["Poor", "Medium", "Good"],
+    )
+    st.dataframe(
+        view[["action_id", "action_title", "strategy_title", "cosine_similarity", "band"]],
+        use_container_width=True,
+    )
 
     st.download_button(
         "Download alignment_results.csv (Top-K matches)",
         data=all_matches.to_csv(index=False).encode("utf-8"),
         file_name="alignment_results.csv",
-        mime="text/csv"
+        mime="text/csv",
+        key="dl_all",
     )
     st.download_button(
         "Download best_matches.csv",
         data=best.to_csv(index=False).encode("utf-8"),
         file_name="best_matches.csv",
-        mime="text/csv"
+        mime="text/csv",
+        key="dl_best",
     )
     st.download_button(
         "Download strategy_alignment_summary.csv",
         data=per_strategy.to_csv(index=False).encode("utf-8"),
         file_name="strategy_alignment_summary.csv",
-        mime="text/csv"
+        mime="text/csv",
+        key="dl_strat",
     )
 
     st.subheader("Live Intelligent Improvements (GPT)")
@@ -281,13 +343,25 @@ if st.button("Run Synchronization", type="primary"):
         pick = st.selectbox(
             "Select low-alignment action",
             options=low["action_id"].tolist(),
-            format_func=lambda aid: f"Action {aid}: {low[low['action_id']==aid]['action_title'].values[0][:90]}"
+            key="low_pick",
+            format_func=lambda aid: f"Action {aid}: {low[low['action_id']==aid]['action_title'].values[0][:90]}",
         )
         row = low[low["action_id"] == pick].iloc[0]
 
-        if st.button("Generate GPT Suggestion"):
+        if st.button("Generate GPT Suggestion", key="gen_gpt"):
             with st.spinner("Calling GPT..."):
-                suggestion = gpt_suggestion(row["strategy_title"], row["action_title"], row["cosine_similarity"])
-                st.text_area("Suggestion Output", suggestion, height=320)
+                try:
+                    st.session_state.gpt_text = gpt_suggestion(
+                        row["strategy_title"],
+                        row["action_title"],
+                        row["cosine_similarity"],
+                    )
+                except Exception as e:
+                    st.session_state.gpt_text = f"GPT call failed: {e}"
+
+        st.text_area("Suggestion Output", st.session_state.gpt_text, height=320, key="gpt_out")
+
     else:
         st.success("No low-alignment actions under current threshold.")
+else:
+    st.info("Click **Run Synchronization** to compute alignment.")
