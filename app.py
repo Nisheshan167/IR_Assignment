@@ -173,8 +173,8 @@ def build_alignment(strat_df: pd.DataFrame, act_df: pd.DataFrame, top_k=3):
 # GPT suggestion
 # -----------------------------
 def gpt_suggestion(strategy_title: str, action_title: str, similarity: float) -> str:
-    if not client:
-        return "OPENAI_API_KEY not set. Add it in Streamlit Cloud → App → Settings → Secrets."
+    if client is None:
+        return "OpenAI client not initialized. Check OPENAI_API_KEY."
 
     prompt = f"""
 You are an expert strategy execution consultant.
@@ -193,12 +193,15 @@ Return in this exact structure:
 5) Owner/role suggestion (1 line)
 """.strip()
 
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        messages=[{"role":"user","content": prompt}],
-        temperature=0.3,
-    )
-    return resp.choices[0].message.content.strip()
+    try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.3,
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        return f"OpenAI request failed: {str(e)}"
 
 # -----------------------------
 # UI
