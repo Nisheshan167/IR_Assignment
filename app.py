@@ -16,8 +16,11 @@ st.set_page_config(page_title="ISPS Dashboard", layout="wide")
 # -----------------------------
 # OpenAI
 # -----------------------------
-api_key = os.getenv("OPENAI_API_KEY")
-client = OpenAI(api_key=api_key) if api_key else None
+api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+
+client = None
+if api_key:
+    client = OpenAI(api_key=api_key)
 
 # -----------------------------
 # Session state init
