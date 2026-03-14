@@ -16,11 +16,24 @@ st.set_page_config(page_title="ISPS Dashboard", layout="wide")
 # -----------------------------
 # OpenAI
 # -----------------------------
-api_key = st.secrets.get("OPENAI_API_KEY", None) or os.getenv("OPENAI_API_KEY")
+api_key = None
+
+try:
+    api_key = st.secrets["OPENAI_API_KEY"]
+except Exception:
+    api_key = os.getenv("OPENAI_API_KEY")
 
 client = None
+openai_status = ""
+
 if api_key:
-    client = OpenAI(api_key=api_key)
+    try:
+        client = OpenAI(api_key=api_key)
+        openai_status = "✅ API key loaded"
+    except Exception as e:
+        openai_status = f"❌ Client init failed: {e}"
+else:
+    openai_status = "❌ No OPENAI_API_KEY found"
 
 # -----------------------------
 # Session state init
@@ -182,8 +195,11 @@ You are an expert strategy execution consultant.
 Strategic Objective:
 {strategy_title}
 
-Current Action (low alignment; similarity={similarity:.3f}):
+Current Action:
 {action_title}
+
+Similarity Score:
+{similarity:.3f}
 
 Return in this exact structure:
 1) Improved action (1–2 sentences)
@@ -196,12 +212,24 @@ Return in this exact structure:
     try:
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
+            messages=[
+                {"role": "system", "content": "You are a precise business planning assistant."},
+                {"role": "user", "content": prompt},
+            ],
             temperature=0.3,
         )
-        return resp.choices[0].message.content.strip()
+
+        if not resp.choices:
+            return "OpenAI returned no choices."
+
+        msg = resp.choices[0].message
+        if not msg or not msg.content:
+            return f"OpenAI returned empty content: {resp}"
+
+        return msg.content.strip()
+
     except Exception as e:
-        return f"OpenAI request failed: {str(e)}"
+        return f"OpenAI request failed: {type(e).__name__}: {e}"
 
 # -----------------------------
 # UI
